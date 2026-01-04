@@ -43,14 +43,61 @@ def load_clients():
     return v1, apps, net, rbac, version_api
 
 
+def get_node_metrics():
+    """Fetch node metrics from metrics.k8s.io API (metrics-server). Returns a dict of nodeName -> (cpu_millicores, mem_bytes) or None if unavailable."""
+    try:
+        from kubernetes import client, config
+        api = client.CustomObjectsApi()
+        metrics = api.list_cluster_custom_object(
+            group="metrics.k8s.io",
+            version="v1beta1",
+            plural="nodes"
+        )
+        usage = {}
+        for item in metrics["items"]:
+            name = item["metadata"]["name"]
+            cpu = item["usage"]["cpu"]
+            mem = item["usage"]["memory"]
+            # Convert cpu (e.g. '123m') to millicores
+            if cpu.endswith('n'):
+                cpu_m = int(cpu[:-1]) / 1_000_000
+            elif cpu.endswith('u'):
+                cpu_m = int(cpu[:-1]) / 1_000
+            elif cpu.endswith('m'):
+                cpu_m = int(cpu[:-1])
+            else:
+                cpu_m = int(cpu)
+            # Convert memory (e.g. '123456Ki', '123Mi') to bytes
+            if mem.endswith('Ki'):
+                mem_b = int(mem[:-2]) * 1024
+            elif mem.endswith('Mi'):
+                mem_b = int(mem[:-2]) * 1024 * 1024
+            elif mem.endswith('Gi'):
+                mem_b = int(mem[:-2]) * 1024 * 1024 * 1024
+            elif mem.endswith('Ti'):
+                mem_b = int(mem[:-2]) * 1024 * 1024 * 1024 * 1024
+            else:
+                mem_b = int(mem)
+            usage[name] = (cpu_m, mem_b)
+        return usage
+    except Exception as e:
+        print("Warning: Could not fetch node metrics (metrics-server not installed?):", e)
+        return None
+
+
 def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.NetworkingV1Api):
     print("\n== Nodes ==")
     nodes = v1.list_node().items
+    node_metrics = get_node_metrics()
     for n in nodes:
         name = n.metadata.name
         status = [c.type for c in n.status.conditions if c.status == 'True']
         roles = ','.join([t for t in (n.metadata.labels or {}).keys() if t.startswith('node-role.kubernetes.io')])
-        print(f"- {name} roles={roles or 'none'} ready_conditions={status}")
+        metrics_str = ""
+        if node_metrics and name in node_metrics:
+            cpu_m, mem_b = node_metrics[name]
+            metrics_str = f" | cpu: {cpu_m}m mem: {mem_b//(1024*1024)}Mi"
+        print(f"- {name} roles={roles or 'none'} ready_conditions={status}{metrics_str}")
 
     print("\n== Namespaces & Pod counts ==")
     for ns in v1.list_namespace().items:
@@ -100,7 +147,6 @@ def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.N
             print(f"    - {pod_name}: {pod_color}{detailed}{Style.RESET_ALL}")
 
 
-        # ...existing code...
 # --- Extra check functions moved to top-level ---
 def api_server_version(version_api: client.VersionApi):
     try:
