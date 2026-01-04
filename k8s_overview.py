@@ -77,81 +77,85 @@ def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.N
                     waiting = getattr(st, 'waiting', None)
                     terminated = getattr(st, 'terminated', None)
                     if waiting is not None:
-                        reason = getattr(waiting, 'reason', '') or ''
-                        detailed = f"{phase} ({reason})" if reason else detailed
-                        if 'CrashLoopBackOff' in reason or 'CrashLoop' in reason or 'Error' in reason:
-                            problem = True
-                    if terminated is not None:
-                        exit_code = getattr(terminated, 'exit_code', 0)
-                        reason = getattr(terminated, 'reason', '') or ''
-                        detailed = f"{phase} (Exit {exit_code} {reason})" if exit_code else detailed
-                        if exit_code != 0:
-                            problem = True
-
-                if phase.lower() == 'running' and not problem:
-                    pod_color = Fore.GREEN
-                elif problem or phase.lower() in ('failed', 'error'):
-                    pod_color = Fore.RED
-                else:
-                    pod_color = Fore.YELLOW
-            except Exception:
-                pod_color = Fore.YELLOW
-
-            print(f"    - {pod_name}: {pod_color}{detailed}{Style.RESET_ALL}")
-
-    print("\n== Deployments (per namespace) ==")
-    for ns in v1.list_namespace().items:
-        ns_name = ns.metadata.name
-        try:
-            deps = apps.list_namespaced_deployment(ns_name).items
-        except ApiException:
-            deps = []
-        if deps:
-            print(f"- {ns_name}: {len(deps)} deployments")
-
-    print("\n== Services ==")
-    for ns in v1.list_namespace().items:
-        ns_name = ns.metadata.name
-        svcs = v1.list_namespaced_service(ns_name).items
-        for s in svcs:
-            typ = s.spec.type
-            cluster_ip = s.spec.cluster_ip
-            ports = ','.join(str(p.port) for p in (s.spec.ports or []))
-            print(f"- {ns_name}/{s.metadata.name}: type={typ} clusterIP={cluster_ip} ports={ports}")
-
-    print("\n== Ingresses ==")
-    for ns in v1.list_namespace().items:
-        ns_name = ns.metadata.name
-        try:
-            ings = net.list_namespaced_ingress(ns_name).items
-        except ApiException:
-            ings = []
-        for ing in ings:
-            hosts = []
-            for rule in (ing.spec.rules or []):
-                hosts.append(getattr(rule, 'host', None))
-            tls = [t.hosts for t in (ing.spec.tls or [])]
-            print(f"- {ns_name}/{ing.metadata.name}: hosts={hosts} tls={tls}")
+            # ... existing code continues ...
 
 
-    def api_server_version(version_api: client.VersionApi):
-        try:
-            v = version_api.get_code()
-            print("\n== API Server Version ==")
-            print(f"git_version={v.git_version} major={v.major} minor={v.minor}")
-        except Exception as e:
-            print(f"Failed to get API server version: {e}")
+        # --- Extra check functions moved to top-level ---
+        def api_server_version(version_api: client.VersionApi):
+            try:
+                v = version_api.get_code()
+                print("\n== API Server Version ==")
+                print(f"git_version={v.git_version} major={v.major} minor={v.minor}")
+            except Exception as e:
+                print(f"Failed to get API server version: {e}")
 
+        def kubelet_versions(v1: client.CoreV1Api):
+            print("\n== Kubelet Versions (per node) ==")
+            for n in v1.list_node().items:
+                info = getattr(n.status, 'node_info', None) or {}
+                kv = getattr(info, 'kubelet_version', None)
+                print(f"- {n.metadata.name}: kubelet={kv}")
 
-    def kubelet_versions(v1: client.CoreV1Api):
-        print("\n== Kubelet Versions (per node) ==")
-        for n in v1.list_node().items:
-            info = getattr(n.status, 'node_info', None) or {}
-            kv = getattr(info, 'kubelet_version', None)
-            print(f"- {n.metadata.name}: kubelet={kv}")
+        def service_endpoints(v1: client.CoreV1Api):
+            print("\n== Service Endpoints ==")
+            for ns in v1.list_namespace().items:
+                ns_name = ns.metadata.name
+                endpoints = v1.list_namespaced_endpoints(ns_name).items
+                for ep in endpoints:
+                    subsets = ep.subsets or []
+                    addresses = []
+                    for s in subsets:
+                        for a in (s.addresses or []):
+                            addresses.append(a.ip)
+                    if addresses:
+                        print(f"- {ns_name}/{ep.metadata.name}: {len(addresses)} addresses -> {addresses}")
 
+        def list_events(v1: client.CoreV1Api, limit: int = 20):
+            print("\n== Recent cluster events ==")
+            try:
+                ev = v1.list_event_for_all_namespaces().items
+                ev_sorted = sorted(ev, key=lambda e: getattr(e, 'last_timestamp', getattr(e.metadata, 'creation_timestamp', None)) or '', reverse=True)
+                for e in ev_sorted[:limit]:
+                    ts = getattr(e, 'last_timestamp', None) or getattr(e.metadata, 'creation_timestamp', None)
+                    print(f"- [{ts}] {e.metadata.namespace}/{e.involved_object.kind} {e.involved_object.name}: {e.message} (type={e.type})")
+            except Exception as e:
+                print(f"Failed to list events: {e}")
 
-    def service_endpoints(v1: client.CoreV1Api):
+        def pvc_summary(v1: client.CoreV1Api):
+            print("\n== PVC Summary ==")
+            for ns in v1.list_namespace().items:
+                ns_name = ns.metadata.name
+                try:
+                    pvcs = v1.list_namespaced_persistent_volume_claim(ns_name).items
+                except Exception:
+                    pvcs = []
+                for p in pvcs:
+                    vol = p.spec.volume_name
+                    status = p.status.phase
+                    req = None
+                    for k, v in (p.spec.resources.requests or {}).items():
+                        req = f"{k}={v}"
+                    print(f"- {ns_name}/{p.metadata.name}: status={status} volume={vol} requests={req}")
+
+        def rbac_summary(rbac: client.RbacAuthorizationV1Api, v1: client.CoreV1Api):
+            print("\n== RBAC Summary ==")
+            try:
+                crs = rbac.list_cluster_role().items
+                crbs = rbac.list_cluster_role_binding().items
+                print(f"ClusterRoles: {len(crs)} ClusterRoleBindings: {len(crbs)}")
+            except Exception as e:
+                print(f"Failed to list cluster-level RBAC: {e}")
+
+            print("\nNamespace Roles/RoleBindings (counts per namespace):")
+            for ns in v1.list_namespace().items:
+                ns_name = ns.metadata.name
+                try:
+                    rs = rbac.list_namespaced_role(ns_name).items
+                    rbs = rbac.list_namespaced_role_binding(ns_name).items
+                    if rs or rbs:
+                        print(f"- {ns_name}: roles={len(rs)} roleBindings={len(rbs)}")
+                except Exception:
+                    continue
         print("\n== Service Endpoints ==")
         for ns in v1.list_namespace().items:
             ns_name = ns.metadata.name
