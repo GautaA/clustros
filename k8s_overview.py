@@ -85,19 +85,69 @@ def get_node_metrics():
         return None
 
 
+def get_node_capacity(v1):
+    """Return dict of nodeName -> (cpu_millicores_capacity, mem_bytes_capacity)"""
+    cap = {}
+    for n in v1.list_node().items:
+        name = n.metadata.name
+        cpu = n.status.capacity.get('cpu', '0')
+        mem = n.status.capacity.get('memory', '0')
+        # cpu is in cores, convert to millicores
+        try:
+            cpu_m = int(float(cpu) * 1000)
+        except Exception:
+            cpu_m = 0
+        # mem is in Ki
+        try:
+            if mem.endswith('Ki'):
+                mem_b = int(mem[:-2]) * 1024
+            elif mem.endswith('Mi'):
+                mem_b = int(mem[:-2]) * 1024 * 1024
+            elif mem.endswith('Gi'):
+                mem_b = int(mem[:-2]) * 1024 * 1024 * 1024
+            else:
+                mem_b = int(mem)
+        except Exception:
+            mem_b = 0
+        cap[name] = (cpu_m, mem_b)
+    return cap
+
+
 def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.NetworkingV1Api):
     print("\n== Nodes ==")
     nodes = v1.list_node().items
     node_metrics = get_node_metrics()
+    node_capacity = get_node_capacity(v1)
     for n in nodes:
         name = n.metadata.name
         status = [c.type for c in n.status.conditions if c.status == 'True']
         roles = ','.join([t for t in (n.metadata.labels or {}).keys() if t.startswith('node-role.kubernetes.io')])
-        metrics_str = ""
-        if node_metrics and name in node_metrics:
-            cpu_m, mem_b = node_metrics[name]
-            metrics_str = f" | cpu: {cpu_m}m mem: {mem_b//(1024*1024)}Mi"
-        print(f"- {name} roles={roles or 'none'} ready_conditions={status}{metrics_str}")
+        print(f"- {name}")
+        print(f"  roles: {roles or 'none'}")
+        print(f"  ready_conditions: {status}")
+        if node_metrics and name in node_metrics and name in node_capacity:
+            cpu_used, mem_used = node_metrics[name]
+            cpu_max, mem_max = node_capacity[name]
+            cpu_pct = cpu_used / cpu_max if cpu_max else 0
+            mem_pct = mem_used / mem_max if mem_max else 0
+            # Color by usage
+            def color(val, pct):
+                if pct < 0.5:
+                    return Fore.GREEN + val + Style.RESET_ALL
+                elif pct < 0.8:
+                    return Fore.YELLOW + val + Style.RESET_ALL
+                else:
+                    return Fore.RED + val + Style.RESET_ALL
+            cpu_str = color(f"{int(cpu_used)}m / {int(cpu_max)}m ({cpu_pct:.0%})", cpu_pct)
+            mem_str = color(f"{mem_used//(1024*1024)}Mi / {mem_max//(1024*1024)}Mi ({mem_pct:.0%})", mem_pct)
+            print(f"  cpu: {cpu_str}")
+            print(f"  mem: {mem_str}")
+        elif node_metrics and name in node_metrics:
+            cpu_used, mem_used = node_metrics[name]
+            print(f"  cpu: {int(cpu_used)}m (usage only)")
+            print(f"  mem: {mem_used//(1024*1024)}Mi (usage only)")
+        else:
+            print("  cpu/mem: metrics unavailable")
 
     print("\n== Namespaces & Pod counts ==")
     for ns in v1.list_namespace().items:
