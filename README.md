@@ -31,12 +31,15 @@ This will:
 - Open an SSH tunnel if configured for the cluster (see config example below)
 - Show node, namespace, and pod info, with resource usage and color-coded output
 
-Other flags:
-- `--extra-checks` for additional cluster checks (API server version, kubelet versions, endpoints, events, PVCs, RBAC)
-- `--dns-test HOST` to test DNS resolution
-- `--tcp-test HOST:PORT` to test TCP connectivity
-- `--tls-check HOST:PORT` to inspect TLS certificates
-- `--pod-probe URL` to run a curl from inside the cluster
+
+#### Cluster operations (require `--cluster`):
+- `--overview` for cluster summary (nodes, pods, etc)
+- `--extra-checks` for additional cluster checks (API server version, kubelet versions, endpoints, events, PVCs, RBAC, resource quotas)
+- `--dns-test HOST` to test DNS resolution (via cluster DNS)
+- `--pod-probe CMD` to run an arbitrary shell command from inside the cluster (e.g. `curl -k https://kubernetes.default`, `nslookup kubernetes.default.svc.cluster.local`)
+
+#### Local checks (do not require `--cluster`):
+- `--tls-check HOST:PORT` to inspect TLS certificates (from your local machine to the target host:port)
 
 ### clustros.yaml config example
 

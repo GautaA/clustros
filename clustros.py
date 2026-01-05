@@ -428,12 +428,6 @@ def dns_test(v1: client.CoreV1Api, name: str, nameserver: Optional[str] = None):
         print(f"DNS resolution failed: {e}")
 
 
-def tcp_connect_test(host: str, port: int, timeout: float = 5.0):
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            print(f"TCP connect to {host}:{port} succeeded")
-    except Exception as e:
-        print(f"TCP connect to {host}:{port} failed: {e}")
 
 
 def tls_inspect(host: str, port: int = 443, timeout: float = 5.0):
@@ -496,14 +490,64 @@ def create_debug_pod_and_exec(v1: client.CoreV1Api, namespace: str, command: str
             pass
 
 
+# Resource quota and limit checks
+
+def resource_quota_and_limit_checks(v1: client.CoreV1Api):
+    print("\n== Resource Quota and Limit Checks ==")
+    # Check resource quotas per namespace
+    found_quota = False
+    for ns in v1.list_namespace().items:
+        ns_name = ns.metadata.name
+        try:
+            quotas = v1.list_namespaced_resource_quota(ns_name).items
+        except Exception:
+            quotas = []
+        for quota in quotas:
+            found_quota = True
+            print(f"- Namespace {ns_name} quota {quota.metadata.name}:")
+            hard = quota.status.hard or {}
+            used = quota.status.used or {}
+            for res, hard_val in hard.items():
+                used_val = used.get(res, '0')
+                try:
+                    # crude numeric check for cpu/memory/pods
+                    h = float(str(hard_val).rstrip('mMi'))
+                    u = float(str(used_val).rstrip('mMi'))
+                    pct = u / h if h else 0
+                except Exception:
+                    pct = 0
+                if pct > 0.9:
+                    print(f"    {res}: {used_val} / {hard_val} (over 90% used!)")
+                elif pct > 0.75:
+                    print(f"    {res}: {used_val} / {hard_val} (over 75% used)")
+                else:
+                    print(f"    {res}: {used_val} / {hard_val}")
+    if not found_quota:
+        print("No resource quotas found in any namespace.")
+    # Check pods/containers without resource requests/limits
+    print("\n== Pods/Containers Without Resource Requests/Limits ==")
+    found_missing = False
+    for ns in v1.list_namespace().items:
+        ns_name = ns.metadata.name
+        pods = v1.list_namespaced_pod(ns_name).items
+        for pod in pods:
+            for c in pod.spec.containers:
+                reqs = c.resources.requests or {}
+                lims = c.resources.limits or {}
+                if not reqs or not lims:
+                    found_missing = True
+                    print(f"- {ns_name}/{pod.metadata.name} container {c.name}: requests={reqs or '{}'} limits={lims or '{}'}")
+    if not found_missing:
+        print("All pods/containers have resource requests and limits set.")
+
+
 def main():
 
     parser = argparse.ArgumentParser(description='Clustros: Multi-cluster Kubernetes overview & debug tool')
     parser.add_argument('--overview', action='store_true', help='Show cluster overview')
     parser.add_argument('--dns-test', metavar='HOST', help='Resolve DNS name (cluster DNS if available)')
-    parser.add_argument('--tcp-test', metavar='HOST:PORT', help='Test TCP connect to HOST:PORT')
     parser.add_argument('--tls-check', metavar='HOST:PORT', help='Inspect TLS cert for HOST:PORT')
-    parser.add_argument('--pod-probe', metavar='URL', help='Create ephemeral pod and curl URL from inside cluster')
+    parser.add_argument('--pod-probe', metavar='CMD', help='Create ephemeral pod and run CMD (shell command) from inside cluster')
     parser.add_argument('--pod-namespace', default='default', help='Namespace to create debug pod in')
     parser.add_argument('--extra-checks', action='store_true', help='Run extra checks: versions, kubelet versions, endpoints, events, PVCs, RBAC')
     parser.add_argument('--cluster', metavar='NAME', help='Cluster name from clustros config to use')
@@ -513,6 +557,9 @@ def main():
 
     tunnel_proc = None
     ssh = None
+    need_api = (
+        args.overview or args.extra_checks or args.dns_test or args.pod_probe
+    )
     if args.cluster:
         from clustros_config import load_config, get_cluster_info, ClusterConfigError
         config_data = load_config(args.config or 'clustros.yaml')
@@ -521,7 +568,7 @@ def main():
         except Exception as e:
             print(f"Failed to get SSH info for cluster: {e}")
             sys.exit(1)
-    if ssh and ssh.get('open_tunnel', False):
+    if need_api and ssh and ssh.get('open_tunnel', False):
         ssh_user = ssh.get('user')
         ssh_host = ssh.get('host')
         ssh_key = ssh.get('key')
@@ -560,17 +607,12 @@ def main():
         list_events(v1)
         pvc_summary(v1)
         rbac_summary(rbac, v1)
+        resource_quota_and_limit_checks(v1)
 
     if args.dns_test:
         dns_test(v1, args.dns_test)
 
-    if args.tcp_test:
-        try:
-            host, port_s = args.tcp_test.rsplit(':', 1)
-            port = int(port_s)
-            tcp_connect_test(host, port)
-        except Exception as e:
-            print('Invalid tcp-test argument, expected host:port', e)
+
 
     if args.tls_check:
         try:
@@ -581,9 +623,8 @@ def main():
             print('Invalid tls-check argument, expected host:port', e)
 
     if args.pod_probe:
-        # run curl inside an ephemeral pod
-        url = args.pod_probe
-        cmd = f"curl -sSL -D - '{url}' || echo 'curl failed'"
+        # run arbitrary shell command inside an ephemeral pod
+        cmd = args.pod_probe
         create_debug_pod_and_exec(v1, args.pod_namespace, cmd)
 
 
