@@ -13,20 +13,25 @@ This small Python tool helps inspect and debug a Kubernetes cluster. It can:
 
 ## Requirements
 - Python 3
-- Kubernetes Python client (`pip install kubernetes`)
+- All Python dependencies in `requirements.txt` (install with `pip install -r requirements.txt`)
 - metrics-server installed in your cluster for resource usage metrics
 
 ## Usage
 
+
+## Multi-Cluster Support & Secure Access
+
+This tool supports multiple clusters and SSH tunneling for secure API access. All cluster and SSH info is stored in `clustros.yaml` (see below for security advice).
+
+### Example usage
+
 ```sh
-python3 k8s_overview.py --overview
+python3 clustros.py --overview --cluster dev
 ```
 
-This will show:
-- Node names, roles, and ready conditions
-- CPU and memory usage for each node (if metrics-server is available)
-- Namespaces and pod counts
-- Deployments, services, ingresses
+This will:
+- Open an SSH tunnel if configured for the cluster (see config example below)
+- Show node, namespace, and pod info, with resource usage and color-coded output
 
 Other flags:
 - `--extra-checks` for additional cluster checks (API server version, kubelet versions, endpoints, events, PVCs, RBAC)
@@ -34,3 +39,22 @@ Other flags:
 - `--tcp-test HOST:PORT` to test TCP connectivity
 - `--tls-check HOST:PORT` to inspect TLS certificates
 - `--pod-probe URL` to run a curl from inside the cluster
+
+### clustros.yaml config example
+
+See `clustros.yaml.example` for a template. Do NOT commit your real `clustros.yaml` to version control!
+
+```yaml
+clusters:
+  dev:
+    kubeconfig: /path/to/your/kubeconfig
+    context: default
+    ssh:
+      user: your_ssh_user
+      host: your.remote.host
+      key: /path/to/your/private-key.pem
+      local_port: 6443
+      remote_host: localhost
+      remote_port: 6443
+      open_tunnel: true
+```

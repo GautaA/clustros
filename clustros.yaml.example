@@ -1,0 +1,16 @@
+# Example clustros.yaml
+# Copy this file to clustros.yaml and fill in your real values. Do NOT commit your real clustros.yaml to version control.
+
+clusters:
+  dev:
+    kubeconfig: /path/to/your/kubeconfig
+    context: default
+    ssh:
+      user: your_ssh_user
+      host: your.remote.host
+      key: /path/to/your/private-key.pem
+      local_port: 6443
+      remote_host: localhost
+      remote_port: 6443
+      open_tunnel: true
+# Add more clusters as needed

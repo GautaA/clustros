@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""k8s_overview.py
+"""clustros.py
 
-Small CLI to inspect a Kubernetes cluster and run simple network/SSL probes.
-
+Clustros: Multi-cluster Kubernetes inspection and debug CLI.
+Supports overview, events, resource usage, and more across clusters.
 """
 import argparse
 import socket
@@ -10,6 +10,7 @@ import ssl
 import sys
 import time
 from typing import Optional
+import os
 
 import dns.resolver
 import requests
@@ -17,23 +18,37 @@ from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from colorama import init as colorama_init, Fore, Style
+from clustros_config import load_config, get_cluster_info, ClusterConfigError
 
 # Initialize colorama for Windows terminals
 colorama_init(autoreset=True)
 
 
-def load_clients():
-    """Load kube config (local) or in-cluster config and return API clients."""
-    try:
-        config.load_kube_config()
-        print("Loaded kube config from local kubeconfig")
-    except Exception:
+def load_clients(cluster=None, config_path=None):
+    """Load kube config (local) or in-cluster config and return API clients. Supports multi-cluster config."""
+    if cluster:
         try:
-            config.load_incluster_config()
-            print("Loaded in-cluster kube config")
-        except Exception as e:
-            print("Failed to load kube config:", e)
+            config_data = load_config(config_path or 'clustros.yaml')
+            kubeconfig, context, _ = get_cluster_info(config_data, cluster)
+            config.load_kube_config(config_file=kubeconfig, context=context)
+            print(f"Loaded kube config for cluster '{cluster}' from {kubeconfig} (context: {context})")
+        except ClusterConfigError as e:
+            print(f"Config error: {e}")
             sys.exit(1)
+        except Exception as e:
+            print(f"Failed to load kube config for cluster '{cluster}': {e}")
+            sys.exit(1)
+    else:
+        try:
+            config.load_kube_config()
+            print("Loaded kube config from local kubeconfig")
+        except Exception:
+            try:
+                config.load_incluster_config()
+                print("Loaded in-cluster kube config")
+            except Exception as e:
+                print("Failed to load kube config:", e)
+                sys.exit(1)
 
     v1 = client.CoreV1Api()
     apps = client.AppsV1Api()
@@ -46,7 +61,6 @@ def load_clients():
 def get_node_metrics():
     """Fetch node metrics from metrics.k8s.io API (metrics-server). Returns a dict of nodeName -> (cpu_millicores, mem_bytes) or None if unavailable."""
     try:
-        from kubernetes import client, config
         api = client.CustomObjectsApi()
         metrics = api.list_cluster_custom_object(
             group="metrics.k8s.io",
@@ -113,11 +127,73 @@ def get_node_capacity(v1):
     return cap
 
 
+def get_pod_metrics(v1):
+    """Fetch pod metrics from metrics.k8s.io API. Returns dict: (namespace, pod_name) -> used_mem_bytes"""
+    try:
+        api = client.CustomObjectsApi()
+        metrics = api.list_cluster_custom_object(
+            group="metrics.k8s.io",
+            version="v1beta1",
+            plural="pods"
+        )
+        usage = {}
+        for item in metrics["items"]:
+            ns = item["metadata"]["namespace"]
+            pod = item["metadata"]["name"]
+            total_mem = 0
+            for c in item["containers"]:
+                mem = c["usage"]["memory"]
+                if mem.endswith('Ki'):
+                    mem_b = int(mem[:-2]) * 1024
+                elif mem.endswith('Mi'):
+                    mem_b = int(mem[:-2]) * 1024 * 1024
+                elif mem.endswith('Gi'):
+                    mem_b = int(mem[:-2]) * 1024 * 1024 * 1024
+                elif mem.endswith('Ti'):
+                    mem_b = int(mem[:-2]) * 1024 * 1024 * 1024 * 1024
+                else:
+                    mem_b = int(mem)
+                total_mem += mem_b
+            usage[(ns, pod)] = total_mem
+        return usage
+    except Exception as e:
+        print("Warning: Could not fetch pod metrics (metrics-server not installed?):", e)
+        return {}
+
+
+def print_colored_events(v1: client.CoreV1Api, limit: int = 30):
+    print("\n== Recent cluster events (warnings/errors) ==")
+    try:
+        ev = v1.list_event_for_all_namespaces().items
+        def get_event_ts(e):
+            ts = getattr(e, 'last_timestamp', None) or getattr(e.metadata, 'creation_timestamp', None)
+            if ts is None:
+                return ""
+            if hasattr(ts, 'isoformat'):
+                return ts.isoformat()
+            return str(ts)
+        ev_sorted = sorted(ev, key=get_event_ts, reverse=True)
+        count = 0
+        for e in ev_sorted:
+            if getattr(e, 'type', None) in ('Warning', 'Error'):
+                ts = get_event_ts(e)
+                color = Fore.YELLOW if e.type == 'Warning' else Fore.RED
+                print(f"{color}- [{ts}] {e.metadata.namespace}/{e.involved_object.kind} {e.involved_object.name}: {e.message} (type={e.type}){Style.RESET_ALL}")
+                count += 1
+                if count >= limit:
+                    break
+        if count == 0:
+            print("No warnings or errors found in recent events.")
+    except Exception as e:
+        print(f"Failed to list events: {e}")
+
+
 def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.NetworkingV1Api):
     print("\n== Nodes ==")
     nodes = v1.list_node().items
     node_metrics = get_node_metrics()
     node_capacity = get_node_capacity(v1)
+    pod_metrics = get_pod_metrics(v1)
     for n in nodes:
         name = n.metadata.name
         status = [c.type for c in n.status.conditions if c.status == 'True']
@@ -154,18 +230,13 @@ def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.N
         ns_name = ns.metadata.name
         pods = v1.list_namespaced_pod(ns_name).items
         print(f"- {ns_name}: pods={len(pods)}")
-
-        # list each pod with a colored status
         for p in pods:
             pod_name = p.metadata.name
             phase = (p.status.phase or '').capitalize()
-
-            # determine detailed status (check container states)
             pod_color = Fore.YELLOW
             detailed = phase
             try:
                 cs = p.status.container_statuses or []
-                # check for CrashLoopBackOff or terminated non-zero exit codes
                 problem = False
                 for c in cs:
                     st = getattr(c, 'state', None)
@@ -184,7 +255,6 @@ def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.N
                         detailed = f"{phase} (Exit {exit_code} {reason})" if exit_code else detailed
                         if exit_code != 0:
                             problem = True
-
                 if phase.lower() == 'running' and not problem:
                     pod_color = Fore.GREEN
                 elif problem or phase.lower() in ('failed', 'error'):
@@ -193,9 +263,20 @@ def cluster_overview(v1: client.CoreV1Api, apps: client.AppsV1Api, net: client.N
                     pod_color = Fore.YELLOW
             except Exception:
                 pod_color = Fore.YELLOW
-
-            print(f"    - {pod_name}: {pod_color}{detailed}{Style.RESET_ALL}")
-
+            # Only show USED memory, color coded
+            used_mem = pod_metrics.get((ns_name, pod_name), None)
+            mem_str = ""
+            if used_mem is not None:
+                if used_mem < 512*1024*1024:
+                    mem_str = Fore.GREEN + f"{used_mem//(1024*1024)}Mi" + Style.RESET_ALL
+                elif used_mem < 1024*1024*1024:
+                    mem_str = Fore.YELLOW + f"{used_mem//(1024*1024)}Mi" + Style.RESET_ALL
+                else:
+                    mem_str = Fore.RED + f"{used_mem//(1024*1024)}Mi" + Style.RESET_ALL
+            else:
+                mem_str = "metrics unavailable"
+            print(f"    - {pod_name}: {pod_color}{detailed}{Style.RESET_ALL} --- {mem_str}")
+    print_colored_events(v1)
 
 # --- Extra check functions moved to top-level ---
 def api_server_version(version_api: client.VersionApi):
@@ -416,7 +497,8 @@ def create_debug_pod_and_exec(v1: client.CoreV1Api, namespace: str, command: str
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Kubernetes cluster overview & debug tool')
+
+    parser = argparse.ArgumentParser(description='Clustros: Multi-cluster Kubernetes overview & debug tool')
     parser.add_argument('--overview', action='store_true', help='Show cluster overview')
     parser.add_argument('--dns-test', metavar='HOST', help='Resolve DNS name (cluster DNS if available)')
     parser.add_argument('--tcp-test', metavar='HOST:PORT', help='Test TCP connect to HOST:PORT')
@@ -424,9 +506,49 @@ def main():
     parser.add_argument('--pod-probe', metavar='URL', help='Create ephemeral pod and curl URL from inside cluster')
     parser.add_argument('--pod-namespace', default='default', help='Namespace to create debug pod in')
     parser.add_argument('--extra-checks', action='store_true', help='Run extra checks: versions, kubelet versions, endpoints, events, PVCs, RBAC')
+    parser.add_argument('--cluster', metavar='NAME', help='Cluster name from clustros config to use')
+    parser.add_argument('--config', metavar='PATH', help='Path to clustros config YAML file (default: clustros.yaml)')
+    # Remove --open-tunnel flag, auto-open tunnel if open_tunnel: true in config
     args = parser.parse_args()
 
-    v1, apps, net, rbac, version_api = load_clients()
+    tunnel_proc = None
+    ssh = None
+    if args.cluster:
+        from clustros_config import load_config, get_cluster_info, ClusterConfigError
+        config_data = load_config(args.config or 'clustros.yaml')
+        try:
+            _, _, ssh = get_cluster_info(config_data, args.cluster)
+        except Exception as e:
+            print(f"Failed to get SSH info for cluster: {e}")
+            sys.exit(1)
+    if ssh and ssh.get('open_tunnel', False):
+        ssh_user = ssh.get('user')
+        ssh_host = ssh.get('host')
+        ssh_key = ssh.get('key')
+        local_port = str(ssh.get('local_port', 6443))
+        remote_host = ssh.get('remote_host', 'localhost')
+        remote_port = str(ssh.get('remote_port', 6443))
+        if not (ssh_user and ssh_host and ssh_key):
+            print("Missing SSH tunnel parameters in config (user, host, key required).")
+            sys.exit(1)
+        import subprocess
+        ssh_cmd = [
+            'ssh',
+            '-i', ssh_key,
+            '-L', f'{local_port}:{remote_host}:{remote_port}',
+            f'{ssh_user}@{ssh_host}',
+            '-N'
+        ]
+        print(f"Opening SSH tunnel: {' '.join(ssh_cmd)}")
+        try:
+            tunnel_proc = subprocess.Popen(ssh_cmd)
+            # Wait a moment for tunnel to establish
+            time.sleep(2)
+        except Exception as e:
+            print(f"Failed to open SSH tunnel: {e}")
+            sys.exit(1)
+
+    v1, apps, net, rbac, version_api = load_clients(cluster=args.cluster, config_path=args.config)
 
     if args.overview:
         cluster_overview(v1, apps, net)
@@ -463,6 +585,12 @@ def main():
         url = args.pod_probe
         cmd = f"curl -sSL -D - '{url}' || echo 'curl failed'"
         create_debug_pod_and_exec(v1, args.pod_namespace, cmd)
+
+
+    if tunnel_proc:
+        print("Closing SSH tunnel...")
+        tunnel_proc.terminate()
+        tunnel_proc.wait()
 
 
 if __name__ == '__main__':
